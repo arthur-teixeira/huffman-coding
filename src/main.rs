@@ -95,6 +95,7 @@ impl HuffmanTree {
 
 struct Bitfield {
     bf: Vec<u8>,
+    len: usize,
     pos: usize,
 }
 
@@ -103,6 +104,7 @@ impl Bitfield {
         Self {
             bf: Vec::new(),
             pos: 0,
+            len: 0,
         }
     }
 
@@ -119,6 +121,25 @@ impl Bitfield {
             self.set_bit((code >> (code_len - 1)) as u8 & 1);
             code_len -= 1;
         }
+    }
+
+    fn next_bit(&mut self) -> Option<u8> {
+        if self.pos / BYTE_SIZE + (BYTE_SIZE - (self.pos % BYTE_SIZE) - 1) > self.len {
+            return None;
+        }
+
+        let a = !!(self.bf)[self.pos / BYTE_SIZE] & (1 << (BYTE_SIZE - ((self.pos) % BYTE_SIZE) - 1));
+        self.pos += 1;
+
+        Some(a)
+    }
+}
+
+impl Iterator for Bitfield {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_bit()
     }
 }
 
@@ -149,7 +170,7 @@ fn construct_huffman_tree(mut freqs: BinaryHeap<HuffmanTree>) -> HuffmanTree {
         .expect("Expected one node to remain in the queue")
 }
 
-fn compress(original: &str, dict: HashMap<char, CharCode>) -> Bitfield {
+fn compress(original: &str, dict: &HashMap<char, CharCode>) -> Bitfield {
     let mut bf = Bitfield::new();
 
     for c in original.chars() {
@@ -158,6 +179,16 @@ fn compress(original: &str, dict: HashMap<char, CharCode>) -> Bitfield {
     }
 
     bf
+}
+
+fn decompress(compressed: &mut Bitfield, dict: &HashMap<char, CharCode>) -> String {
+    compressed.len = compressed.pos;
+    compressed.pos = 0;
+    for bit in compressed {
+        println!("{:#01b}", bit);
+    }
+
+    "".into()
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -169,7 +200,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let input_path = &args[1];
     let input = fs::read_to_string(input_path)?;
-    // let input = "A_DEAD_DAD_CEDED_A_BAD_BABE_A_BEADED_ABACA_BED";
 
     let queue = enqueue_chars(&input);
     let tree = construct_huffman_tree(queue.into());
@@ -177,6 +207,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut s = Vec::new();
     let mut dict = HashMap::new();
     tree.construct_dictionary(&mut s, &mut dict);
+    let mut compressed = compress(&input, &dict);
+
+    decompress(&mut compressed, &dict);
 
     Ok(())
 }
