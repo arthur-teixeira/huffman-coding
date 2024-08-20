@@ -6,38 +6,20 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Debug, Clone, Copy)]
+const BYTE_SIZE: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialOrd)]
 pub struct Prob(f64);
 
-// /\<1\>/0/gI
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CharCode(usize, u8);
+
 impl PartialEq for Prob {
     fn eq(&self, other: &Self) -> bool {
-        self.0.eq(&other.0)
+        other.0.eq(&self.0)
     }
 }
 impl Eq for Prob {}
-
-impl PartialOrd for Prob {
-    fn lt(&self, other: &Self) -> bool {
-        self.0.lt(&other.0)
-    }
-
-    fn le(&self, other: &Self) -> bool {
-        self.0.le(&other.0)
-    }
-
-    fn gt(&self, other: &Self) -> bool {
-        self.0.gt(&other.0)
-    }
-
-    fn ge(&self, other: &Self) -> bool {
-        self.0.ge(&other.0)
-    }
-
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        other.0.partial_cmp(&self.0) // Reversed because it will be used in a Min-heap
-    }
-}
 
 impl Ord for Prob {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -45,10 +27,38 @@ impl Ord for Prob {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HuffmanTree {
     Leaf(char, Prob),
     Node(Prob, Rc<HuffmanTree>, Rc<HuffmanTree>),
+}
+
+impl PartialOrd for HuffmanTree {
+    fn lt(&self, other: &Self) -> bool {
+        other.prob().lt(&self.prob())
+    }
+
+    fn le(&self, other: &Self) -> bool {
+        other.prob().le(&self.prob())
+    }
+
+    fn gt(&self, other: &Self) -> bool {
+        other.prob().gt(&self.prob())
+    }
+
+    fn ge(&self, other: &Self) -> bool {
+        other.prob().ge(&self.prob())
+    }
+
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        other.prob().partial_cmp(&self.prob())
+    }
+}
+
+impl Ord for HuffmanTree {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
 }
 
 impl HuffmanTree {
@@ -56,6 +66,58 @@ impl HuffmanTree {
         match self {
             Self::Leaf(_, p) => p.0,
             Self::Node(p, ..) => p.0,
+        }
+    }
+
+    fn construct_dictionary(&self, stack: &mut Vec<u8>, result: &mut HashMap<char, CharCode>) {
+        match self {
+            HuffmanTree::Leaf(c, _) => {
+                let mut snapshot = stack.clone();
+                let mut code: usize = 0;
+                while snapshot.len() > 0 {
+                    let i = snapshot.pop().unwrap();
+                    code = (code << 1) | i as usize;
+                }
+                result.insert(*c, CharCode(code, stack.len() as u8));
+            }
+            HuffmanTree::Node(_, l, r) => {
+                stack.push(0);
+                l.construct_dictionary(stack, result);
+                stack.pop();
+
+                stack.push(1);
+                r.construct_dictionary(stack, result);
+                stack.pop();
+            }
+        }
+    }
+}
+
+struct Bitfield {
+    bf: Vec<u8>,
+    pos: usize,
+}
+
+impl Bitfield {
+    fn new() -> Self {
+        Self {
+            bf: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn set_bit(&mut self, val: u8) {
+        if self.bf.len() <= (self.pos / BYTE_SIZE) {
+            self.bf.push(0);
+        }
+        self.bf[self.pos / BYTE_SIZE] |= val << (BYTE_SIZE - ((self.pos) % BYTE_SIZE) - 1);
+        self.pos += 1;
+    }
+
+    fn write(&mut self, CharCode(code, mut code_len): &CharCode) {
+        while code_len > 0 {
+            self.set_bit((code >> (code_len - 1)) as u8 & 1);
+            code_len -= 1;
         }
     }
 }
@@ -87,15 +149,15 @@ fn construct_huffman_tree(mut freqs: BinaryHeap<HuffmanTree>) -> HuffmanTree {
         .expect("Expected one node to remain in the queue")
 }
 
-fn print_tree(t: &HuffmanTree) {
-    match t {
-        HuffmanTree::Leaf(c, Prob(p)) => print!("{}: {} ", c, p),
-        HuffmanTree::Node(_, a, b) => {
-            print_tree(a);
-            println!();
-            print_tree(b);
-        }
+fn compress(original: &str, dict: HashMap<char, CharCode>) -> Bitfield {
+    let mut bf = Bitfield::new();
+
+    for c in original.chars() {
+        let code = dict.get(&c).expect("Character is not in dictionary");
+        bf.write(code);
     }
+
+    bf
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -107,25 +169,83 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let input_path = &args[1];
     let input = fs::read_to_string(input_path)?;
-    let input = "A_DEAD_DAD_CEDED_A_BAD_BABE_A_BEADED_ABACA_BED";
+    // let input = "A_DEAD_DAD_CEDED_A_BAD_BABE_A_BEADED_ABACA_BED";
 
     let queue = enqueue_chars(&input);
-    let tree = construct_huffman_tree(queue);
-    print_tree(&tree);
+    let tree = construct_huffman_tree(queue.into());
+
+    let mut s = Vec::new();
+    let mut dict = HashMap::new();
+    tree.construct_dictionary(&mut s, &mut dict);
 
     Ok(())
 }
 
 #[cfg(test)]
 mod huffman_test {
-    use crate::{enqueue_chars, HuffmanTree, Prob};
+    use crate::{compress, construct_huffman_tree, enqueue_chars, HuffmanTree, Prob};
+    use std::collections::HashMap;
+
+    fn get_compressed(sut: &str) -> crate::Bitfield {
+        let queue = enqueue_chars(sut);
+        let tree = construct_huffman_tree(queue);
+        let mut dict = HashMap::new();
+        let mut stack = Vec::new();
+        tree.construct_dictionary(&mut stack, &mut dict);
+        for c in sut.chars() {
+            let code = dict.get(&c).unwrap();
+            println!("char {} has code {:#08b} with len {}", c, code.0, code.1);
+        }
+
+        compress(sut, dict)
+    }
 
     #[test]
     fn test_char_freq() {
-        let sut = "aaabbc";
+        let sut = "ddddeeeeeaaabbc";
         let mut queue = enqueue_chars(sut);
-        assert_eq!(queue.pop(), Some(HuffmanTree::Leaf('c', Prob(1f64 / 6f64))));
-        assert_eq!(queue.pop(), Some(HuffmanTree::Leaf('b', Prob(1f64 / 3f64))));
-        assert_eq!(queue.pop(), Some(HuffmanTree::Leaf('a', Prob(1f64 / 2f64))));
+        assert_eq!(
+            queue.pop(),
+            Some(HuffmanTree::Leaf('c', Prob(1f64 / sut.len() as f64)))
+        );
+        assert_eq!(
+            queue.pop(),
+            Some(HuffmanTree::Leaf('b', Prob(2f64 / sut.len() as f64)))
+        );
+        assert_eq!(
+            queue.pop(),
+            Some(HuffmanTree::Leaf('a', Prob(3f64 / sut.len() as f64)))
+        );
+    }
+
+    #[test]
+    fn test_reverse_tree_cmp() {
+        let a = HuffmanTree::Leaf('a', Prob(1f64));
+        let b = HuffmanTree::Leaf('b', Prob(3f64));
+
+        assert_eq!(a < b, !(1 < 3));
+    }
+
+    #[test]
+    fn test_compression() {
+        let compressed = get_compressed("AAB");
+        assert_eq!(compressed.bf, vec![0b11000000]);
+        assert_eq!(compressed.pos, 3);
+
+        let compressed = get_compressed("AAABBA");
+        assert_eq!(compressed.bf, vec![0b11100100]);
+        assert_eq!(compressed.pos, 6);
+
+        let compressed = get_compressed("AAABB");
+        assert_eq!(compressed.bf, vec![0b11100000]);
+        assert_eq!(compressed.pos, 5);
+
+        let compressed = get_compressed("AAAAAAABA");
+        assert_eq!(compressed.bf, vec![0b11111110, 0b10000000]);
+        assert_eq!(compressed.pos, 9);
+
+        let compressed = get_compressed("AAAACCCB");
+        assert_eq!(compressed.bf, vec![0b00001111, 0b11010000]);
+        assert_eq!(compressed.pos, 12);
     }
 }
