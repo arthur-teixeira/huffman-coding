@@ -72,8 +72,13 @@ impl HuffmanTree {
     fn construct_dictionary(&self, stack: &mut Vec<u8>, result: &mut HashMap<char, CharCode>) {
         match self {
             HuffmanTree::Leaf(c, _) => {
-                let mut snapshot = stack.clone();
                 let mut code: usize = 0;
+                if stack.len() == 0 {
+                    result.insert(*c, CharCode(code, 1));
+                    return;
+                }
+
+                let mut snapshot = stack.clone();
                 while snapshot.len() > 0 {
                     let i = snapshot.pop().unwrap();
                     code = (code << 1) | i as usize;
@@ -93,6 +98,7 @@ impl HuffmanTree {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Bitfield {
     bf: Vec<u8>,
     len: usize,
@@ -124,14 +130,24 @@ impl Bitfield {
     }
 
     fn next_bit(&mut self) -> Option<u8> {
-        if self.pos / BYTE_SIZE + (BYTE_SIZE - (self.pos % BYTE_SIZE) - 1) > self.len {
+        if self.pos >= self.len {
             return None;
         }
 
-        let a = !!(self.bf)[self.pos / BYTE_SIZE] & (1 << (BYTE_SIZE - ((self.pos) % BYTE_SIZE) - 1));
+        let a = self.bf[self.pos / BYTE_SIZE] & (1 << (BYTE_SIZE - 1 - (self.pos % BYTE_SIZE))) > 0;
         self.pos += 1;
 
-        Some(a)
+        Some(a as u8)
+    }
+
+    fn at(&self, pos: usize) -> Option<u8> {
+        if pos >= self.len {
+            return None;
+        }
+
+        let a = self.bf[pos / BYTE_SIZE] & (1 << (BYTE_SIZE - 1 - (pos % BYTE_SIZE))) > 0;
+
+        Some(a as u8)
     }
 }
 
@@ -181,14 +197,53 @@ fn compress(original: &str, dict: &HashMap<char, CharCode>) -> Bitfield {
     bf
 }
 
-fn decompress(compressed: &mut Bitfield, dict: &HashMap<char, CharCode>) -> String {
+fn decompress(compressed: &mut Bitfield, tree: &HuffmanTree) -> String {
     compressed.len = compressed.pos;
     compressed.pos = 0;
-    for bit in compressed {
-        println!("{:#01b}", bit);
-    }
+    let mut result = String::new();
+    dbg!(&compressed);
+    dbg!(tree);
+    decompress_recur(compressed, tree, tree, 0, &mut result, false);
 
-    "".into()
+    result
+}
+
+fn decompress_recur(
+    compressed: &mut Bitfield,
+    root: &HuffmanTree,
+    node: &HuffmanTree,
+    pos: usize,
+    result: &mut String,
+    last: bool,
+) {
+    match node {
+        HuffmanTree::Leaf(c, _) => {
+            println!("Reached a leaf with character {c}");
+            result.push(*c);
+            decompress_recur(compressed, root, root, pos, result, false);
+        }
+        HuffmanTree::Node(_, l, r) => {
+            let bit = compressed.at(pos);
+            println!("pos: {}, result: {}, bit: {:?}", pos, result, bit);
+            match bit {
+                Some(0) => {
+                    println!("Got a bit 0, recurring with left node");
+                    decompress_recur(compressed, root, l, pos + 1, result, false)
+                }
+                Some(1) => {
+                    println!("Got a bit 1, recurring with right node");
+                    decompress_recur(compressed, root, r, pos + 1, result, false)
+                }
+                None => {
+                    println!("We are at the last position, should get a leaf right here");
+                    if !last {
+                        decompress_recur(compressed, root, node, pos, result, true);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -208,18 +263,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut dict = HashMap::new();
     tree.construct_dictionary(&mut s, &mut dict);
     let mut compressed = compress(&input, &dict);
-
-    decompress(&mut compressed, &dict);
+    let decompressed = decompress(&mut compressed, &tree);
 
     Ok(())
 }
 
 #[cfg(test)]
 mod huffman_test {
-    use crate::{compress, construct_huffman_tree, enqueue_chars, HuffmanTree, Prob};
+    use crate::{
+        compress, construct_huffman_tree, decompress, enqueue_chars, Bitfield, HuffmanTree, Prob,
+    };
     use std::collections::HashMap;
 
     fn get_compressed(sut: &str) -> crate::Bitfield {
+        let queue = enqueue_chars(sut);
+        let tree = construct_huffman_tree(queue);
+        let mut dict = HashMap::new();
+        let mut stack = Vec::new();
+        tree.construct_dictionary(&mut stack, &mut dict);
+        compress(sut, &dict)
+    }
+
+    fn get_compressed_and_tree(sut: &str) -> (crate::Bitfield, crate::HuffmanTree) {
         let queue = enqueue_chars(sut);
         let tree = construct_huffman_tree(queue);
         let mut dict = HashMap::new();
@@ -230,7 +295,7 @@ mod huffman_test {
             println!("char {} has code {:#08b} with len {}", c, code.0, code.1);
         }
 
-        compress(sut, dict)
+        (compress(sut, &dict), tree)
     }
 
     #[test]
@@ -280,5 +345,45 @@ mod huffman_test {
         let compressed = get_compressed("AAAACCCB");
         assert_eq!(compressed.bf, vec![0b00001111, 0b11010000]);
         assert_eq!(compressed.pos, 12);
+
+        let compressed = get_compressed("A");
+        assert_eq!(compressed.bf, vec![0]);
+        assert_eq!(compressed.pos, 1);
+    }
+
+    #[test]
+    fn test_bit_iteration() {
+        let bits = Bitfield {
+            bf: vec![1],
+            len: 8,
+            pos: 0,
+        };
+
+        let result: Vec<u8> = bits.into_iter().collect();
+        assert_eq!(result, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let bits = Bitfield {
+            bf: vec![4],
+            len: 6,
+            pos: 0,
+        };
+
+        let result: Vec<u8> = bits.into_iter().collect();
+        assert_eq!(result, vec![0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_decompression() {
+        // let sut = "A";
+        // let (mut compressed, tree) = get_compressed_and_tree(sut);
+        // assert_eq!(decompress(&mut compressed, &tree), sut);
+
+        // let sut = "AB";
+        // let (mut compressed, tree) = get_compressed_and_tree(sut);
+        // assert_eq!(decompress(&mut compressed, &tree), sut);
+
+        let sut = "ABC";
+        let (mut compressed, tree) = get_compressed_and_tree(sut);
+        assert_eq!(decompress(&mut compressed, &tree), sut);
     }
 }
