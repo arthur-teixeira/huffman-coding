@@ -1,8 +1,9 @@
 use std::{
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, VecDeque},
     env,
     error::Error,
-    fs,
+    fs::{self, OpenOptions},
+    os::unix::fs::FileExt,
     rc::Rc,
 };
 
@@ -62,6 +63,8 @@ impl Ord for HuffmanTree {
 }
 
 impl HuffmanTree {
+    const NODE: u8 = 0xFF;
+
     fn prob(&self) -> f64 {
         match self {
             Self::Leaf(_, p) => p.0,
@@ -79,6 +82,7 @@ impl HuffmanTree {
                 }
 
                 let mut snapshot = stack.clone();
+                snapshot.reverse();
                 while snapshot.len() > 0 {
                     let i = snapshot.pop().unwrap();
                     code = (code << 1) | i as usize;
@@ -95,6 +99,55 @@ impl HuffmanTree {
                 stack.pop();
             }
         }
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut buf: VecDeque<u8> = VecDeque::new();
+        let mut queue: VecDeque<&HuffmanTree> = VecDeque::new();
+        queue.push_back(self);
+
+        while queue.len() > 0 {
+            let node = queue.pop_front().unwrap();
+            match node {
+                HuffmanTree::Node(_, l, r) => {
+                    buf.push_back(Self::NODE);
+                    queue.push_back(l);
+                    queue.push_back(r);
+                }
+                HuffmanTree::Leaf(c, _) => {
+                    buf.push_back(*c as u8);
+                }
+            }
+        }
+
+        buf.push_front(buf.len() as u8);
+
+        buf.into()
+    }
+
+    fn deserialize_tree<'a>(buf: &mut impl Iterator<Item = &'a u8>) -> Option<Rc<HuffmanTree>> {
+        if let Some(byte) = buf.next() {
+            match *byte {
+                Self::NODE => {
+                    let left = Self::deserialize_tree(buf)?;
+                    let right = Self::deserialize_tree(buf)?;
+                    Some(Rc::new(HuffmanTree::Node(Prob(0.0), left, right)))
+                }
+                value => Some(Rc::new(HuffmanTree::Leaf(value as char, Prob(0.0)))),
+            }
+        } else {
+            None
+        }
+    }
+
+    fn from_buffer(buf: Vec<u8>) -> Option<Rc<Self>> {
+        let len = buf.get(0)?;
+        if buf.len() != (len + 1) as usize {
+            return None;
+        }
+
+        let tree_buf = &buf[1..=*len as usize];
+        Self::deserialize_tree(&mut tree_buf.into_iter())
     }
 }
 
@@ -201,9 +254,7 @@ fn decompress(compressed: &mut Bitfield, tree: &HuffmanTree) -> String {
     compressed.len = compressed.pos;
     compressed.pos = 0;
     let mut result = String::new();
-    dbg!(&compressed);
-    dbg!(tree);
-    decompress_recur(compressed, tree, tree, 0, &mut result, false);
+    decompress_recur(compressed, tree, tree, 0, &mut result);
 
     result
 }
@@ -214,46 +265,30 @@ fn decompress_recur(
     node: &HuffmanTree,
     pos: usize,
     result: &mut String,
-    last: bool,
 ) {
     match node {
         HuffmanTree::Leaf(c, _) => {
-            println!("Reached a leaf with character {c}");
-            result.push(*c);
-            decompress_recur(compressed, root, root, pos, result, false);
+            if root == node {
+                let a: String = std::iter::repeat(c).take(compressed.len).collect();
+                result.push_str(&a);
+            } else {
+                result.push(*c);
+                decompress_recur(compressed, root, root, pos, result);
+            }
         }
         HuffmanTree::Node(_, l, r) => {
             let bit = compressed.at(pos);
-            println!("pos: {}, result: {}, bit: {:?}", pos, result, bit);
             match bit {
-                Some(0) => {
-                    println!("Got a bit 0, recurring with left node");
-                    decompress_recur(compressed, root, l, pos + 1, result, false)
-                }
-                Some(1) => {
-                    println!("Got a bit 1, recurring with right node");
-                    decompress_recur(compressed, root, r, pos + 1, result, false)
-                }
-                None => {
-                    println!("We are at the last position, should get a leaf right here");
-                    if !last {
-                        decompress_recur(compressed, root, node, pos, result, true);
-                    }
-                }
+                Some(0) => decompress_recur(compressed, root, l, pos + 1, result),
+                Some(1) => decompress_recur(compressed, root, r, pos + 1, result),
+                None => {}
                 _ => unreachable!(),
             }
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        println!("Usage: {} <input-file> <output-file>", args[0]);
-        return Ok(());
-    }
-
-    let input_path = &args[1];
+fn do_compression(input_path: &str, output_path: &str) -> Result<(), Box<dyn Error>> {
     let input = fs::read_to_string(input_path)?;
 
     let queue = enqueue_chars(&input);
@@ -262,10 +297,59 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut s = Vec::new();
     let mut dict = HashMap::new();
     tree.construct_dictionary(&mut s, &mut dict);
-    let mut compressed = compress(&input, &dict);
-    let decompressed = decompress(&mut compressed, &tree);
+
+    let compressed = compress(&input, &dict);
+    let mut file_contents = tree.serialize();
+    dbg!(&file_contents);
+    file_contents.extend_from_slice(&compressed.bf);
+
+    let new_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(output_path)?;
+
+    new_file.write_at(&file_contents, 0)?;
 
     Ok(())
+}
+
+fn do_decompression(input_path: &str, output_path: &str) -> Result<(), Box<dyn Error>> {
+    let input = fs::read(input_path)?;
+
+    let tree = match HuffmanTree::from_buffer(input) {
+        Some(tree) => tree,
+        None => {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid file",
+            )))
+        }
+    };
+
+    println!("Tree constructed {:?}", tree);
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 4 {
+        println!("Usage: {} <operation> <input-file> <output-file>", args[0]);
+        return Ok(());
+    }
+
+    let operation = &args[1];
+    let input_path = &args[2];
+    let output_path = &args[3];
+
+    match operation.as_str() {
+        "-c" => do_compression(input_path, output_path),
+        "-d" => do_decompression(input_path, output_path),
+        _ => {
+            println!("Unknown command!");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +358,7 @@ mod huffman_test {
         compress, construct_huffman_tree, decompress, enqueue_chars, Bitfield, HuffmanTree, Prob,
     };
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     fn get_compressed(sut: &str) -> crate::Bitfield {
         let queue = enqueue_chars(sut);
@@ -325,33 +410,6 @@ mod huffman_test {
     }
 
     #[test]
-    fn test_compression() {
-        let compressed = get_compressed("AAB");
-        assert_eq!(compressed.bf, vec![0b11000000]);
-        assert_eq!(compressed.pos, 3);
-
-        let compressed = get_compressed("AAABBA");
-        assert_eq!(compressed.bf, vec![0b11100100]);
-        assert_eq!(compressed.pos, 6);
-
-        let compressed = get_compressed("AAABB");
-        assert_eq!(compressed.bf, vec![0b11100000]);
-        assert_eq!(compressed.pos, 5);
-
-        let compressed = get_compressed("AAAAAAABA");
-        assert_eq!(compressed.bf, vec![0b11111110, 0b10000000]);
-        assert_eq!(compressed.pos, 9);
-
-        let compressed = get_compressed("AAAACCCB");
-        assert_eq!(compressed.bf, vec![0b00001111, 0b11010000]);
-        assert_eq!(compressed.pos, 12);
-
-        let compressed = get_compressed("A");
-        assert_eq!(compressed.bf, vec![0]);
-        assert_eq!(compressed.pos, 1);
-    }
-
-    #[test]
     fn test_bit_iteration() {
         let bits = Bitfield {
             bf: vec![1],
@@ -374,16 +432,46 @@ mod huffman_test {
 
     #[test]
     fn test_decompression() {
-        // let sut = "A";
-        // let (mut compressed, tree) = get_compressed_and_tree(sut);
-        // assert_eq!(decompress(&mut compressed, &tree), sut);
+        let sut = "A";
+        let (mut compressed, tree) = get_compressed_and_tree(sut);
+        assert_eq!(decompress(&mut compressed, &tree), sut);
 
-        // let sut = "AB";
-        // let (mut compressed, tree) = get_compressed_and_tree(sut);
-        // assert_eq!(decompress(&mut compressed, &tree), sut);
+        let sut = "AAAAAAA";
+        let (mut compressed, tree) = get_compressed_and_tree(sut);
+        assert_eq!(decompress(&mut compressed, &tree), sut);
+
+        let sut = "AB";
+        let (mut compressed, tree) = get_compressed_and_tree(sut);
+        assert_eq!(decompress(&mut compressed, &tree), sut);
 
         let sut = "ABC";
         let (mut compressed, tree) = get_compressed_and_tree(sut);
         assert_eq!(decompress(&mut compressed, &tree), sut);
+
+        let sut = "A_DEAD_DAD_CEDED_A_BAD_BABE_A_BEADED_ABACA_";
+        let (mut compressed, tree) = get_compressed_and_tree(sut);
+        assert_eq!(decompress(&mut compressed, &tree), sut);
+    }
+
+    #[test]
+    fn test_tree_serialization() {
+        let tree: HuffmanTree = HuffmanTree::Node(
+            Prob(0.0),
+            Rc::new(HuffmanTree::Leaf('C', Prob(0.0))),
+            Rc::new(HuffmanTree::Node(
+                Prob(0.0),
+                Rc::new(HuffmanTree::Leaf('A', Prob(0.0))),
+                Rc::new(HuffmanTree::Leaf('B', Prob(0.0))),
+            )),
+        );
+
+        let serialized = tree.serialize();
+        assert_eq!(
+            serialized,
+            vec![5, HuffmanTree::NODE, b'C', HuffmanTree::NODE, b'A', b'B',]
+        );
+
+        let newtree = HuffmanTree::from_buffer(serialized).expect("Expected tree");
+        assert_eq!(tree, *newtree.clone());
     }
 }
